@@ -16,6 +16,7 @@ RUN pip install -r requirements.txt
 
 COPY app ./app
 COPY static ./static
+COPY tests ./tests
 
 EXPOSE 8000
 # 容器内线程数收敛，CPU 环境行为稳定

@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>人工偏好 DPO 微调台 · Preference DPO Lab</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2129; --line: #2c3743;
+    --txt: #d8e0e8; --muted: #8a97a5; --accent: #4da3ff;
+    --ok: #3fb96b; --bad: #ff5c5c; --warn: #e0a13c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--txt);
+    font-family: "SF Mono", "Menlo", "Consolas", monospace; font-size: 14px;
+  }
+  header { padding: 18px 28px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0 0 6px; font-size: 20px; }
+  header p { margin: 0; color: var(--muted); font-size: 12px; }
+  nav { margin-top: 10px; display: flex; gap: 14px; }
+  nav a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  main { padding: 24px 28px; max-width: 1280px; margin: 0 auto; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px; margin-bottom: 20px;
+  }
+  label { display: block; color: var(--muted); margin-bottom: 6px; font-size: 12px; }
+  textarea, input[type=text], input[type=number] {
+    width: 100%; background: #0c1116; color: var(--txt);
+    border: 1px solid var(--line); border-radius: 6px; padding: 9px;
+    font-family: inherit; font-size: 13px;
+  }
+  textarea { min-height: 60px; resize: vertical; }
+  button {
+    background: var(--accent); color: #08111c; border: 0; border-radius: 6px;
+    padding: 9px 20px; font-weight: 700; cursor: pointer; font-family: inherit;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button.danger { background: transparent; color: var(--bad); border: 1px solid var(--bad); padding: 6px 12px; }
+  .toolbar { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 20px;
+    font-size: 12px; font-weight: 700;
+  }
+  .badge.idle { background: rgba(138,151,165,.18); color: var(--muted); border: 1px solid var(--muted); }
+  .badge.running { background: rgba(77,163,255,.18); color: var(--accent); border: 1px solid var(--accent); }
+  .badge.success { background: rgba(63,185,107,.18); color: var(--ok); border: 1px solid var(--ok); }
+  .badge.failed, .badge.invalidated { background: rgba(255,92,92,.18); color: var(--bad); border: 1px solid var(--bad); }
+  h3 { margin: 0 0 10px; font-size: 14px; color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .pair-row td { vertical-align: top; }
+  .cell-input { position: relative; }
+  .counter { position: absolute; right: 6px; bottom: 4px; font-size: 10px; color: var(--muted); }
+  .counter.over { color: var(--bad); }
+  .invalid input, .invalid textarea { border-color: var(--bad); }
+  .metric { display: flex; justify-content: space-between; padding: 4px 0; color: var(--muted); }
+  .metric b { color: var(--txt); }
+  .err { color: var(--bad); margin-top: 10px; white-space: pre-wrap; }
+  .note { color: var(--warn); margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
+  .hidden { display: none; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .pos { color: var(--ok); }
+  .neg { color: var(--bad); }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 12px; border: 1px solid var(--line); color: var(--muted); }
+  .fp { user-select: all; color: var(--muted); }
+  .spinner {
+    display: inline-block; width: 12px; height: 12px; border: 2px solid var(--accent);
+    border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite;
+    vertical-align: middle; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>人工偏好 DPO 微调台
+    <span style="color:var(--muted);font-weight:400;font-size:13px">Preference DPO · 3 步整批均值 · β=0.1 · Adam lr=0.001</span>
+  </h1>
+  <p>每次训练都从原目标权重的深拷贝开始，原模型作冻结参考；逐对累积梯度（不保留多对图）与独立整批参考两条实现交叉校验，更新参数最大绝对误差须 ≤ 1e-5。训练不改写原草稿/目标模型的权重、KV 与前向计数。</p>
+  <nav>
+    <a href="/">← 推测解码对照页（训练期间仍可正常使用）</a>
+    <a href="/dpo">偏好 DPO 微调页</a>
+  </nav>
+</header>
+<main>
+  <!-- 偏好集编辑 -->
+  <section class="panel">
+    <h3>偏好集（1～8 组；提示词 / 优选续写 / 劣选续写各 1～32 个可打印 ASCII 字符）</h3>
+    <table>
+      <thead>
+        <tr><th style="width:42px">#</th><th>提示词 prompt</th><th>优选续写 chosen</th><th>劣选续写 rejected</th><th style="width:70px"></th></tr>
+      </thead>
+      <tbody id="pairBody"></tbody>
+    </table>
+    <div class="toolbar">
+      <button class="ghost" id="addRow" type="button">＋ 增加一组</button>
+      <span class="muted" id="rowCount"></span>
+    </div>
+    <div class="toolbar">
+      <button id="save" type="button">保存偏好集到服务端</button>
+      <button id="train" type="button">启动 DPO 训练（3 步）</button>
+      <span class="muted" id="saveState"></span>
+    </div>
+    <div class="err hidden" id="editErr"></div>
+    <div class="note hidden" id="editNote"></div>
+  </section>
+
+  <!-- 任务状态 -->
+  <section class="panel">
+    <h3>训练任务状态</h3>
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+      <span class="badge idle" id="stateBadge">idle</span>
+      <span id="stateText" class="muted">尚未启动</span>
+    </div>
+    <div id="runningBox" class="hidden" style="margin-top:12px">
+      <div class="metric"><span><span class="spinner"></span>在途任务 job_id</span><b id="runJob">-</b></div>
+      <div class="metric"><span>对应输入版本 / 指纹</span><b id="runVersion">-</b></div>
+      <div class="metric"><span>样本组数</span><b id="runPairs">-</b></div>
+      <div class="metric"><span>启动时间 (UTC)</span><b id="runStarted">-</b></div>
+      <div class="note">训练期间两个窗口仍可编辑同一偏好集或运行原解码对照；任何保存编辑都会永久废止本在途结果，改回也不恢复。</div>
+    </div>
+    <div id="terminalErr" class="err hidden"></div>
+  </section>
+
+  <!-- 上次成功结果 -->
+  <section id="successPanel" class="panel hidden">
+    <h3>上次成功训练结果（仅训练成功且对照通过后展示）</h3>
+    <div class="metric"><span>结果所属输入版本 / 指纹</span><b><span id="resVersion">-</span> / <span class="fp" id="resFp">-</span></b></div>
+    <div class="metric"><span>对应输入摘要</span><b id="resSummary" class="muted"></b></div>
+    <div class="metric"><span>job_id / 完成时间 (UTC)</span><b><span id="resJob">-</span> · <span id="resTime">-</span></b></div>
+    <div class="metric"><span>参数交叉校验最大绝对误差（容差 1e-5）</span><b id="resParamErr" class="pos">-</b></div>
+    <div class="metric"><span>训练前单序列/整批打分最大误差</span><b id="resScoreErr">-</b></div>
+    <div class="metric"><span>超参数</span><b id="resHyper">-</b></div>
+    <h3 style="margin-top:16px">每步整批均值 DPO 损失（两条实现对照）</h3>
+    <table>
+      <thead><tr><th>步骤</th><th>逐对累积路径损失</th><th>独立整批参考损失</th><th>差值</th></tr></thead>
+      <tbody id="lossBody"></tbody>
+    </table>
+    <h3 style="margin-top:16px">各组续写得分（仅累加续写 token 条件对数概率，不添 EOS）</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>提示词</th><th>续写</th>
+          <th>训练前得分</th><th>训练后得分</th><th>冻结参考得分</th>
+          <th>间隔 前→后（优选-劣选）</th>
+        </tr>
+      </thead>
+      <tbody id="scoreBody"></tbody>
+    </table>
+  </section>
+
+  <!-- 无成功结果时的占位说明 -->
+  <section id="emptyPanel" class="panel">
+    <span class="muted">尚无成功训练结果。保存偏好集后点击「启动 DPO 训练」；失败或被废止时，这里会继续保留上一次成功结果及其输入标注。</span>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const POLL_MS = 1200;
+let serverVersion = 0;
+let dirty = false;
+let pollTimer = null;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+// ---------- 编辑区 ----------
+function makeRow(pair) {
+  const tr = document.createElement("tr");
+  tr.className = "pair-row";
+  tr.innerHTML =
+    '<td class="idx"></td>' +
+    '<td><div class="cell-input"><textarea data-field="prompt" maxlength="64"></textarea>' +
+      '<span class="counter"></span></div></td>' +
+    '<td><div class="cell-input"><textarea data-field="chosen" maxlength="64"></textarea>' +
+      '<span class="counter"></span></div></td>' +
+    '<td><div class="cell-input"><textarea data-field="rejected" maxlength="64"></textarea>' +
+      '<span class="counter"></span></div></td>' +
+    '<td><button class="danger" type="button">删除</button></td>';
+  tr.querySelector("textarea[data-field=prompt]").value = pair.prompt || "";
+  tr.querySelector("textarea[data-field=chosen]").value = pair.chosen || "";
+  tr.querySelector("textarea[data-field=rejected]").value = pair.rejected || "";
+  tr.querySelector(".danger").onclick = () => {
+    if ($("pairBody").children.length <= 1) { showErr("至少保留 1 组样本。"); return; }
+    tr.remove(); renumber(); markDirty();
+  };
+  tr.querySelectorAll("textarea").forEach((ta) => {
+    ta.addEventListener("input", () => { markDirty(); refreshCounters(); });
+  });
+  return tr;
+}
+
+function renumber() {
+  [...$("pairBody").children].forEach((tr, i) => {
+    tr.querySelector(".idx").textContent = i + 1;
+  });
+  $("rowCount").textContent = `当前 ${$("pairBody").children.length} 组（允许 1～8 组）`;
+  $("addRow").disabled = $("pairBody").children.length >= 8;
+}
+
+function refreshCounters() {
+  document.querySelectorAll(".pair-row").forEach((tr) => {
+    tr.classList.remove("invalid");
+    tr.querySelectorAll("textarea").forEach((ta) => {
+      const cnt = ta.parentElement.querySelector(".counter");
+      const n = ta.value.length;
+      cnt.textContent = n + "/32";
+      cnt.classList.toggle("over", n < 1 || n > 32 || /[^\x20-\x7E]/.test(ta.value));
+    });
+  });
+}
+
+function collectPairs() {
+  const pairs = [];
+  let valid = true;
+  document.querySelectorAll(".pair-row").forEach((tr) => {
+    const get = (f) => tr.querySelector(`textarea[data-field=${f}]`).value;
+    const p = { prompt: get("prompt"), chosen: get("chosen"), rejected: get("rejected") };
+    for (const [k, v] of Object.entries(p)) {
+      const ok = v.length >= 1 && v.length <= 32 && /^[\x20-\x7E]+$/.test(v);
+      if (!ok) { valid = false; tr.classList.add("invalid"); }
+    }
+    pairs.push(p);
+  });
+  return { pairs, valid };
+}
+
+function markDirty() {
+  dirty = true;
+  $("saveState").textContent = "有未保存修改（保存后版本号递增；训练在途时会废止在途结果）";
+}
+
+function showErr(msg) { $("editErr").textContent = msg; $("editErr").classList.remove("hidden"); }
+function clearErr() { $("editErr").classList.add("hidden"); $("editErr").textContent = ""; }
+function showNote(msg) {
+  if (!msg) { $("editNote").classList.add("hidden"); return; }
+  $("editNote").textContent = msg; $("editNote").classList.remove("hidden");
+}
+
+async function loadPreferences() {
+  const r = await fetch("/api/preferences");
+  const data = await r.json();
+  // 本地有未保存修改时不覆盖用户输入（多窗口场景由版本号/指纹区分）
+  if (dirty) return;
+  serverVersion = data.version;
+  $("pairBody").innerHTML = "";
+  data.pairs.forEach((p) => $("pairBody").appendChild(makeRow(p)));
+  renumber(); refreshCounters();
+  $("saveState").textContent =
+    `已加载服务端版本 v${data.version} · 指纹 ${data.fingerprint}（更新于 ${data.updated_at}）`;
+}
+
+$("addRow").onclick = () => {
+  if ($("pairBody").children.length >= 8) return;
+  $("pairBody").appendChild(makeRow({ prompt: "", chosen: "", rejected: "" }));
+  renumber(); refreshCounters(); markDirty();
+};
+
+$("save").onclick = async () => {
+  clearErr(); showNote("");
+  const { pairs, valid } = collectPairs();
+  if (!valid) { showErr("校验失败：每段必须为 1～32 个可打印 ASCII 字符（空格到 ~）。"); return; }
+  if (pairs.length < 1 || pairs.length > 8) { showErr("样本组数必须在 1～8 之间。"); return; }
+  try {
+    const r = await fetch("/api/preferences", {
+      method: "PUT", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ pairs }),
+    });
+    const data = await r.json();
+    if (!r.ok) { showErr(data.error || "保存失败"); return; }
+    dirty = false;
+    serverVersion = data.preferences.version;
+    $("saveState").textContent =
+      `已保存：版本 v${data.preferences.version} · 指纹 ${data.preferences.fingerprint}`;
+    showNote(data.notice || "");
+  } catch (e) { showErr(String(e)); }
+};
+
+$("train").onclick = async () => {
+  clearErr();
+  if (dirty) { showErr("请先保存偏好集，再启动训练（训练以服务端版本为准）。"); return; }
+  try {
+    const r = await fetch("/api/dpo/train", { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) { showErr(data.error || "启动失败"); return; }
+    showNote("训练已启动（后台线程，不阻塞本页与解码对照页）。");
+    poll();
+  } catch (e) { showErr(String(e)); }
+};
+
+// ---------- 状态轮询 ----------
+function badge(cls, text) {
+  const b = $("stateBadge");
+  b.className = "badge " + cls;
+  b.textContent = text;
+}
+
+function renderStatus(s) {
+  const running = s.state === "running";
+  $("runningBox").classList.toggle("hidden", !running);
+  $("terminalErr").classList.add("hidden");
+  if (running) {
+    badge("running", "running");
+    $("stateText").textContent = "训练进行中……";
+    if (s.current) {
+      $("runJob").textContent = s.current.job_id;
+      $("runVersion").textContent = "v" + s.current.version + " · " + s.current.fingerprint;
+      $("runPairs").textContent = s.current.n_pairs;
+      $("runStarted").textContent = s.current.started_at;
+    }
+  } else if (s.state === "success") {
+    badge("success", "success");
+    $("stateText").textContent = "训练成功且交叉校验通过。";
+  } else if (s.state === "failed") {
+    badge("failed", "failed");
+    $("stateText").textContent = "训练失败，上次成功结果已保留。";
+    if (s.last_terminal && s.last_terminal.error) {
+      $("terminalErr").textContent = s.last_terminal.error;
+      $("terminalErr").classList.remove("hidden");
+    }
+  } else if (s.state === "invalidated") {
+    badge("invalidated", "invalidated");
+    $("stateText").textContent = "在途结果因偏好集被编辑而废止，上次成功结果已保留。";
+    if (s.last_terminal && s.last_terminal.error) {
+      $("terminalErr").textContent = s.last_terminal.error;
+      $("terminalErr").classList.remove("hidden");
+    }
+  } else {
+    badge("idle", "idle");
+    $("stateText").textContent = "尚未启动";
+  }
+
+  const rec = s.last_success;
+  $("successPanel").classList.toggle("hidden", !rec);
+  $("emptyPanel").classList.toggle("hidden", !!rec);
+  if (rec && rec.result) renderSuccess(rec);
+  if (running) {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(poll, POLL_MS);
+  }
+}
+
+function fmt(x, digits = 6) {
+  return Number(x).toFixed(digits);
+}
+
+function renderSuccess(rec) {
+  const r = rec.result;
+  $("resVersion").textContent = "v" + rec.version;
+  $("resFp").textContent = rec.fingerprint;
+  $("resSummary").textContent = rec.input_summary
+    .map((p) => `#${p.index}「${p.prompt}」${p.chosen}/${p.rejected}`).join("　");
+  $("resJob").textContent = rec.job_id;
+  $("resTime").textContent = rec.finished_at;
+  $("resParamErr").textContent = fmt(r.max_abs_param_error, 3) + "（≤ 1e-5）";
+  $("resScoreErr").textContent = fmt(r.max_abs_prescore_error, 3);
+  $("resHyper").textContent =
+    `β=${r.beta}, steps=${r.steps}, Adam lr=${r.lr}, pairs=${r.n_pairs}`;
+
+  const lb = $("lossBody");
+  lb.innerHTML = "";
+  r.step_losses.forEach((s) => {
+    const tr = document.createElement("tr");
+    const d = Math.abs(s.pairwise_loss - s.fullbatch_loss);
+    tr.innerHTML = `<td>${s.step}</td><td>${fmt(s.pairwise_loss, 8)}</td>` +
+      `<td>${fmt(s.fullbatch_loss, 8)}</td><td>${d.toExponential(2)}</td>`;
+    lb.appendChild(tr);
+  });
+
+  const sb = $("scoreBody");
+  sb.innerHTML = "";
+  r.pair_scores.forEach((sc) => {
+    const tr = document.createElement("tr");
+    const cls = sc.margin_post >= sc.margin_pre ? "pos" : "neg";
+    tr.innerHTML =
+      `<td rowspan="2">${sc.index}</td>` +
+      `<td rowspan="2">${esc(sc.prompt)}</td>` +
+      `<td>优选 ${esc(sc.chosen)}</td>` +
+      `<td>${fmt(sc.chosen_pre)}</td><td>${fmt(sc.chosen_post)}</td>` +
+      `<td>${fmt(sc.chosen_ref)}</td>` +
+      `<td rowspan="2" class="${cls}">${fmt(sc.margin_pre, 4)} → ${fmt(sc.margin_post, 4)}</td>`;
+    sb.appendChild(tr);
+    const tr2 = document.createElement("tr");
+    tr2.innerHTML =
+      `<td>劣选 ${esc(sc.rejected)}</td>` +
+      `<td>${fmt(sc.rejected_pre)}</td><td>${fmt(sc.rejected_post)}</td>` +
+      `<td>${fmt(sc.rejected_ref)}</td>`;
+    sb.appendChild(tr2);
+  });
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/dpo/status");
+    const s = await r.json();
+    renderStatus(s);
+    // 非编辑状态下同步其他窗口对偏好集的修改
+    if (!dirty) loadPreferences();
+  } catch (e) {
+    pollTimer = setTimeout(poll, POLL_MS * 2);
+  }
+}
+
+(async function init() {
+  await loadPreferences();
+  await poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

@@ -99,7 +99,8 @@ class CausalTransformer(nn.Module):
     # ---- 前向 ----
     def _attention_layer(self, x: torch.Tensor,
                          layer: nn.TransformerEncoderLayer,
-                         layer_idx: int, use_cache: bool) -> torch.Tensor:
+                         layer_idx: int, use_cache: bool,
+                         padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         B, T, _ = x.shape
         # norm_first 结构，缓存/无缓存两条路径完全共用这份计算
         h = layer.norm1(x)
@@ -132,6 +133,21 @@ class CausalTransformer(nn.Module):
             # 无缓存整序列：完整因果三角遮挡
             attn_mask = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
 
+        # 批量 padding 遮罩（仅无缓存批量前向使用）：把被填充位置的
+        # key/value 在所有 query 处屏蔽。形状 (B, 1, 1, T) 可与
+        # (T, T) 因果遮罩广播相加，且不参与 logits 收集，填充位置
+        # 的输出无意义，因此不引入任何有效位置的数值差异。
+        # 若整批没有任何填充位置，则不传显式遮罩（传全零遮罩会让 SDPA
+        # 走不同内核，破坏与单序列路径的逐位一致性）。
+        if padding_mask is not None and bool(padding_mask.any()):
+            pad = torch.zeros(B, T)
+            pad.masked_fill_(padding_mask, float("-inf"))
+            pad = pad.view(B, 1, 1, T)
+            if attn_mask is None:
+                attn_mask = pad
+            else:
+                attn_mask = pad + attn_mask.unsqueeze(0).unsqueeze(0)
+
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         out = layer.self_attn.out_proj(out)
@@ -142,13 +158,16 @@ class CausalTransformer(nn.Module):
         return x
 
     def forward(self, token_ids: list[int] | torch.Tensor,
-                use_cache: bool) -> torch.Tensor:
+                use_cache: bool,
+                padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         """前向计算，返回 logits。
 
         - 传入 token id 列表（或 1D 张量）：返回形状 (seq_len, vocab_size)；
         - 传入 2D 张量：返回 (batch, seq_len, vocab_size)，仅无缓存模式支持。
         use_cache=True 时走增量路径并追加/复用 KV 缓存；
         use_cache=False 时整序列重算（基线路径），不触碰缓存。
+        padding_mask（可选，bool，True=被填充位置）仅支持无缓存批量前向，
+        供 DPO 独立整批参考实现使用；单序列调用行为完全不变。
         每次调用 forward_count += 1。
         """
         self.forward_count += 1
@@ -162,6 +181,7 @@ class CausalTransformer(nn.Module):
         T = x_in.shape[1]
 
         if use_cache:
+            assert padding_mask is None, "增量 KV 路径不支持 padding mask"
             if self._cache is None:
                 self.init_cache()
             positions = torch.arange(self.cache_len, self.cache_len + T)
@@ -170,7 +190,7 @@ class CausalTransformer(nn.Module):
 
         h = self.tok_emb(x_in) + self.pos_emb(positions)
         for i, layer in enumerate(self.blocks):
-            h = self._attention_layer(h, layer, i, use_cache)
+            h = self._attention_layer(h, layer, i, use_cache, padding_mask)
         logits = self.lm_head(self.ln_f(h))
         if use_cache:
             self.cache_len += T
